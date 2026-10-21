@@ -268,7 +268,7 @@ brew install openssl pkg-config
 
 ### Pre-built binaries
 
-Releases page: <https://github.com/<your-org>/php2shell/releases>
+Releases page: <https://github.com/kaxm23/php2shell/releases>
 
 | Platform | Binary |
 |---|---|
