@@ -21,9 +21,7 @@ execution by racing PHP's `session.upload_progress` feature.
 
 ## ⚠️ Legal notice — read this first
 
-**This tool is for authorized security testing only.**
 
-**This tool is for authorized security testing only.**
 
 This tool is provided **strictly for**:
 
