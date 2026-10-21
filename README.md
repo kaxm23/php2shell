@@ -8,7 +8,6 @@
 |  php2shell — session upload progress RCE  |
 |  Authorized security testing only         |
 +-------------------------------------------+
-```
 
 # php2shell
 
