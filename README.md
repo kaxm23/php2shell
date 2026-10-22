@@ -242,7 +242,7 @@ of "look, I can see my payload in the response" non-vulnerabilities.
 ### From source (recommended)
 
 ```bash
-git clone https://github.com/<your-org>/php2shell.git
+git clone https://github.com/kaxm23/php2shell.git
 cd php2shell
 cargo build --release
 sudo install -m 0755 target/release/php2shell /usr/local/bin/
