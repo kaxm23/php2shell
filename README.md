@@ -20,9 +20,7 @@ feature. **It reports `UNCONFIRMED` at most — never `CONFIRMED` / RCE.**
 
 ## ⚠️ Legal notice — read this first
 
-**This tool is for authorized security testing only.**
 
-**This tool is for authorized security testing only.**
 
 This tool is provided **strictly for**:
 
