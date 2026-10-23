@@ -123,7 +123,7 @@ into RCE.** That is the entire point of the tool.
   If the upload endpoint is behind auth, you must pass `--sid` from a real
   session (see [Step 3](#step-3-first-exploit-attempt)).
 - **It is NOT a blind exploit.** Without `--lfi`, php2shell can only prove
-  the race succeeded (`Poisoned` verdict) — it cannot prove command
+  the race succeeded (`UNCONFIRMED` verdict) — it cannot prove command
   execution without reading the response.
 - **It is NOT a WAF bypass.** Aggressive WAFs will block the LFI requests.
   See [Troubleshooting](#troubleshooting) for tuning.
@@ -431,7 +431,7 @@ After the run, look at the verdict block:
 
 ```
 ==============================================
-  VERDICT:      Rce
+  VERDICT:      UNCONFIRMED
   Target:       http://lab.local/
   SID:          k3f9m2x8p1q7r4t6v0y5w2z8n3
   Attempts:     1
@@ -443,23 +443,22 @@ After the run, look at the verdict block:
 
 | Verdict | What it means | What to do |
 |---|---|---|
-| **`Rce`** | Command executed. You have proof. | Done. Save the report and move on. |
-| **`Poisoned`** | Race succeeded, LFI fired, but no proof of execution | See [Troubleshooting](#troubleshooting) — usually session path, strict mode, or LFI path |
-| **`NoLfi`** | Race succeeded, but no `--lfi` supplied | Add `--lfi` and retry. **Not a "not vulnerable" result.** |
-| **`Crash`** | 5xx / timeout / connection reset during race | Investigate — could be filter, crash, or transient. Retry once. |
-| **`AuthRequired`** | 3xx to login page | Upload endpoint needs auth — get a real SID and pass `--sid` |
-| **`Blocked`** | 3xx to non-login page | WAF or access gate — try `--lfi-workers 1 --lfi-interval 500` |
-| **`Miss`** | Target not detected as PHP | Double-check the target URL |
+| **`UNCONFIRMED`** | Command executed. You have proof. | Done. Save the report and move on. |
+| **`UNCONFIRMED`** | Race succeeded, LFI fired, but no proof of execution | See [Troubleshooting](#troubleshooting) — usually session path, strict mode, or LFI path |
+| **`NO_LFI`** | Race succeeded, but no `--lfi` supplied | Add `--lfi` and retry. **Not a "not vulnerable" result.** |
+| **`HTTP_ERROR`** | 5xx / timeout / connection reset during race | Investigate — could be filter, crash, or transient. Retry once. |
+| **`AUTH_REQUIRED`** | 3xx to login page | Upload endpoint needs auth — get a real SID and pass `--sid` |
+| **`HTTP_ERROR`** | 3xx to non-login page | WAF or access gate — try `--lfi-workers 1 --lfi-interval 500` |
+| **`UNKNOWN`** | Target not detected as PHP | Double-check the target URL |
 | **`DryRun`** | `--dry-run` completed | Expected — nothing sent |
 | **`Error`** | Fatal error | See error message in the report |
 
-**`NoLfi` is not `Patched`. `NoLfi` is not "not vulnerable."**
-**`NoLfi` is not `Patched`. `NoLfi` is not "not vulnerable."**
+**`NO_LFI` is not `Patched`. `NO_LFI` is not "not vulnerable."**
 
-`NoLfi` means: *I succeeded at the race, but I have no way to verify
+`NO_LFI` means: *I succeeded at the race, but I have no way to verify
 because you didn't supply an LFI. Run again with `--lfi`.*
 
-If you see `NoLfi` and file a "not vulnerable" report, **you have not
+If you see `NO_LFI` and file a "not vulnerable" report, **you have not
 tested the target.** Always supply `--lfi`.
 
 ### Step 5: Prove command execution
@@ -480,15 +479,15 @@ php2shell -c 'id; hostname; whoami; uname -a; head -3 /etc/passwd' \
 - `uname -a` — confirms OS/arch
 - `head /etc/passwd` — confirms read access to sensitive files
 
-**A report needs evidence, not just "the tool says Rce."**
-**A report needs evidence, not just "the tool says Rce."**
+**A report needs evidence, not just "the tool says UNCONFIRMED."**
+**A report needs evidence, not just "the tool says UNCONFIRMED."**
 
 The output in the verdict block and in `proof.json` is that evidence.
 Paste it into your deliverable.
 
 ### Step 6: Retries and tuning
 
-If the first attempt gives `Poisoned` (not `Rce`), try these in order:
+If the first attempt gives `UNCONFIRMED` (not `Rce`), try these in order:
 
 **A. Increase retries.**
 
@@ -554,7 +553,7 @@ php2shell --sid "$SID" \
 ```
 
 If the SID is regenerated (visible in `Set-Cookie`), the tool reports
-`Poisoned` with a warning in `notes`.
+`UNCONFIRMED` with a warning in `notes`.
 
 ### Step 7: Save the report
 
@@ -604,7 +603,7 @@ Every flag, what it does, and when to use it.
 | `-s, --stall <MS>` | `1350` | Milliseconds to stall between upload chunks. Must exceed `session.upload_progress.min_freq` (default `1000`). Increase for slow targets. |
 | `--lfi-workers <N>` | `8` | Concurrent LFI requests during the stall. More = higher hit chance, but noisier. |
 | `--lfi-interval <MS>` | `100` | Delay between LFI attempts per worker. Decrease for aggressive, increase for WAF evasion. |
-| `--lfi-max-requests <N>` | `5000` | Global cap on total LFI requests per attempt. Prevents runaway firing. |
+| `--lfi-max-attempts <N>` | `5000` | Global cap on total LFI requests per attempt. Prevents runaway firing. |
 | `--retries <N>` | `1` | Full end-to-end attempts. Fresh SID each attempt unless `--sid` given. |
 
 ### Session control
@@ -638,6 +637,35 @@ Every flag, what it does, and when to use it.
 
 ---
 
+## Verdicts
+
+`classify()` evaluates in this order; the first matching row wins.
+
+| # | Observation | Verdict |
+|---|---|---|
+| 1 | Transport error or timeout before a usable response | `UNKNOWN` |
+| 2 | HTTP 429, or an exhausted rate-limit header | `RATE_LIMITED` |
+| 3 | HTTP 401 | `AUTH_REQUIRED` |
+| 4 | HTTP 3xx whose Location resolves same-origin to a login path | `AUTH_REQUIRED` |
+| 5 | HTTP 3xx whose Location does not match a login gate | `HTTP_ERROR` |
+| 6 | HTTP 5xx (including 503 with `Retry-After`) | `HTTP_ERROR` |
+| 7 | Both markers present in the response body | `UNCONFIRMED` |
+| 8 | LFI attempts > 0, no markers | `NO_LFI` |
+| 9 | HTTP 2xx, no `--lfi` template supplied | `UNCONFIRMED` |
+| 10 | Anything else | `UNKNOWN` |
+
+`Retry-After` is recorded in the report (`retry_after`) and surfaced as a
+note, but does not change the verdict. It signals a *requested delay* —
+maintenance, overload, and gateway backoff all send it — not proof of
+rate limiting.
+
+`UNCONFIRMED` is an honest result when the evidence cannot distinguish
+execution from reflection. Even non-empty output between markers is not
+proof by itself. This build has no `CONFIRMED` / RCE verdict, and
+`execution_confirmed` is `false` on every path.
+
+---
+
 ## All verdicts explained
 
 Nine possible verdicts, each with a specific meaning. **Learn them all.**
@@ -645,20 +673,19 @@ Nine possible verdicts, each with a specific meaning. **Learn them all.**
 
 | Verdict | Meaning | Severity | Next step |
 |---|---|---|---|
-| **`Rce`** | Command output observed bracketed by two markers in the LFI response | **Confirmed RCE** | Save report, done |
-| **`Poisoned`** | Race succeeded and LFI fired, but no proof of execution | **Inconclusive** | See Troubleshooting |
-| **`NoLfi`** | Race succeeded, no `--lfi` supplied | **Untested** | Run again with `--lfi` |
-| **`Crash`** | 5xx / timeout / connection reset during the race | **Needs investigation** | Retry once, then inspect |
-| **`AuthRequired`** | 3xx redirect to a login-looking path | **Blocked by auth** | Obtain a real SID, use `--sid` |
-| **`Blocked`** | 3xx redirect to a non-login path (WAF, CDN, gate) | **Blocked by filter** | Slow down with `--lfi-workers 1 --lfi-interval 500` |
-| **`Miss`** | Target does not appear to be PHP | **Not applicable** | Double-check URL, skip fingerprint to force |
+| **`UNCONFIRMED`** | Command output observed bracketed by two markers in the LFI response | **Confirmed RCE** | Save report, done |
+| **`UNCONFIRMED`** | Race succeeded and LFI fired, but no proof of execution | **Inconclusive** | See Troubleshooting |
+| **`NO_LFI`** | Race succeeded, no `--lfi` supplied | **Untested** | Run again with `--lfi` |
+| **`HTTP_ERROR`** | 5xx / timeout / connection reset during the race | **Needs investigation** | Retry once, then inspect |
+| **`AUTH_REQUIRED`** | 3xx redirect to a login-looking path | **Blocked by auth** | Obtain a real SID, use `--sid` |
+| **`HTTP_ERROR`** | 3xx redirect to a non-login path (WAF, CDN, gate) | **Blocked by filter** | Slow down with `--lfi-workers 1 --lfi-interval 500` |
+| **`UNKNOWN`** | Target does not appear to be PHP | **Not applicable** | Double-check URL, skip fingerprint to force |
 | **`DryRun`** | `--dry-run` completed | **N/A** | Expected — nothing sent |
 | **`Error`** | Fatal orchestration error | **N/A** | See error message |
 
-**Only `Rce` is a positive finding.**
-**Only `Rce` is a positive finding.**
+**This build has no `CONFIRMED` verdict. `UNCONFIRMED` is not a positive finding.**
 
-`Poisoned`, `NoLfi`, and `Crash` are **not** negative findings — they are
+`UNCONFIRMED`, `NO_LFI`, and `HTTP_ERROR` are **not** negative findings — they are
 **inconclusive** findings. Do not report them as "not vulnerable." Report
 them as "attempted, inconclusive, see notes."
 
@@ -731,14 +758,14 @@ If `Rce`:
 
 ```
 ==============================================
-  VERDICT:      Rce
+  VERDICT:      UNCONFIRMED
   Output:       uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ==============================================
 ```
 
 Done. Move to Step 5.
 
-If `Poisoned`, move to Step 6 (Troubleshooting).
+If `UNCONFIRMED`, move to Step 6 (Troubleshooting).
 
 ### Step 5 — Full proof
 
@@ -763,7 +790,7 @@ The `lab-engagement-2025.json` file now contains:
 
 ### Step 6 — Troubleshooting (if needed)
 
-If you got `Poisoned` at Step 4, try in order:
+If you got `UNCONFIRMED` at Step 4, try in order:
 
 1. **Increase retries**: `--retries 5`
 2. **Increase stall**: `--stall 2500`
@@ -772,14 +799,13 @@ If you got `Poisoned` at Step 4, try in order:
 5. **Check verbose output** for `LFI ... -> 404` (wrong path) vs `-> 200` (right path, wrong content)
 6. **Try authenticated SID** with `--sid` if target uses strict mode
 
-**Repeat until `Rce` or you've exhausted all options.**
-**Repeat until `Rce` or you've exhausted all options.**
+**Repeat until both markers appear or you've exhausted all options.**
 
 ---
 
 ## Troubleshooting
 
-### `Poisoned` verdict
+### `UNCONFIRMED` verdict
 
 Most common case. The race fired but didn't hit. Check in order:
 
@@ -822,12 +848,12 @@ If yes, the marker sits inside a serialized string and never executes. **Not
 detected by php2shell.** Mitigation is heap grooming, out of scope. Check
 `phpinfo()` or server config if accessible.
 
-### `NoLfi` verdict
+### `NO_LFI` verdict
 
 You didn't supply `--lfi`. Run again with `--lfi`. **This is not a "not
 vulnerable" result.** It is a "you didn't test" result.
 
-### `AuthRequired` verdict
+### `AUTH_REQUIRED` verdict
 
 The upload endpoint redirected to a login page. You need authentication.
 Log in with the app first, extract the PHPSESSID, and pass `--sid`:
@@ -836,7 +862,9 @@ Log in with the app first, extract the PHPSESSID, and pass `--sid`:
 php2shell --sid 'real-session-id' --cookie 'auth=1' --lfi '...' http://lab.local/
 ```
 
-### `Blocked` verdict
+### `HTTP_ERROR` verdict
+
+> Applies to **both** 5xx/timeout/reset *and* non-login 3xx (WAF/gate/CDN).
 
 WAF or access gate blocked the LFI. Slow down:
 
@@ -850,7 +878,6 @@ If still blocked, try a different User-Agent:
 php2shell -A 'Mozilla/5.0 (compatible; Googlebot/2.1)' --lfi '...' http://lab.local/
 ```
 
-### `Crash` verdict
 
 5xx, timeout, or connection reset during the race. Retry once:
 
@@ -861,7 +888,7 @@ php2shell --retries 2 --lfi '...' http://lab.local/
 If it consistently crashes, investigate — could be a filter that crashes on
 include, or a resource exhaustion. Report it as a separate finding.
 
-### `Miss` verdict
+### `UNKNOWN` verdict
 
 Target doesn't appear to be PHP. Double-check the URL:
 
@@ -879,7 +906,7 @@ php2shell --skip-fingerprint --lfi '...' http://lab.local/
 
 - Reduce `--timeout`: `--timeout 5`
 - Reduce `--lfi-workers`: `--lfi-workers 4`
-- Reduce `--lfi-max-requests`: `--lfi-max-requests 1000`
+- Reduce `--lfi-max-attempts`: `--lfi-max-attempts 1000`
 
 ---
 
@@ -893,7 +920,7 @@ CVE, cite the LFI in the application — not php2shell.
 
 ### Why does `--lfi` matter so much?
 
-Because `Poisoned` alone proves *nothing* about whether the target is
+Because `UNCONFIRMED` alone proves *nothing* about whether the target is
 vulnerable. The race can succeed against any PHP target with upload
 progress enabled. Only the LFI proves the poisoning is *reachable* and
 *executable*. **Without `--lfi`, you have not tested anything.**
@@ -913,10 +940,10 @@ content between them proves `system()` ran. See [How proof works](#how-proof-of-
 `--sid`). This is intentional — a fresh SID means a fresh session file,
 which avoids one failed attempt poisoning the next.
 
-### Why does `NoLfi` exist?
+### Why does `NO_LFI` exist?
 
-Because reporting `NoLfi` as "not vulnerable" is the #1 cause of false
-negatives for this technique. `NoLfi` is explicitly a *not tested* verdict,
+Because reporting `NO_LFI` as "not vulnerable" is the #1 cause of false
+negatives for this technique. `NO_LFI` is explicitly a *not tested* verdict,
 not a *not vulnerable* verdict.
 
 ### Can I use this without an LFI?
@@ -952,7 +979,7 @@ OpenSSL or use the pre-built binary. See [Installation](#installation).
 
 If the target uses `php_serialize` (non-default but common in modern
 frameworks), the marker sits inside a serialized string and never executes.
-**Not detected by php2shell.** You will see `Poisoned` with no explanation.
+**Not detected by php2shell.** You will see `UNCONFIRMED` with no explanation.
 Mitigation is heap grooming, which is out of scope.
 
 ### `session.use_strict_mode=1`
@@ -997,7 +1024,7 @@ consider `--proxy` through a rotating pool.
 | `phpggc` | PHP object injection | N/A | N/A | N/A | N/A |
 
 None of the above implements the two-marker proof or a verdict system that
-distinguishes `NoLfi` from `Poisoned` from `Rce`. That's the niche.
+distinguishes `NO_LFI` from `UNCONFIRMED` from `Rce`. That's the niche.
 
 ---
 
@@ -1008,25 +1035,27 @@ Every run can emit a structured report with `-o report.json`:
 ```json
 {
   "target": "http://lab.local/",
-  "verdict": "RCE",
+  "verdict": "UNCONFIRMED",
   "attempts": 2,
-  "php_detected": true,
+  "php_signal_detected": true,
   "php_version": "8.2.7",
   "sid": "k3f9m2x8p1q7r4t6v0y5w2z8n3",
   "sid_charset": "Default5",
   "session_name": "PHPSESSID",
   "stall_ms": 1350,
-  "command": "id; hostname",
+  "command": "echo PHP_TRANSPORT_PROBE_OK",
   "param": "c",
   "payload": "<?php $m=\"PFMARK_a8k2n9z1\";echo $m;system($_GET['c']);echo $m;?>",
   "lfi_template": "http://lab.local/download.php?file=/var/lib/php/sessions/sess_%SID%&c=%CMD%",
   "race_http_status": 200,
   "race_note": "Normal response from upload endpoint",
   "lfi_hits": 1,
-  "lfi_requests": 47,
-  "marker_found": true,
-  "command_output": "uid=33(www-data) gid=33(www-data) groups=33(www-data)\nlab-web01\n",
-  "command_disabled": false,
+  "lfi_attempts": 47,
+  "marker_pair_detected": true,
+  "marker_output": "PHP_TRANSPORT_PROBE_OK",
+  "execution_confirmed": false,
+  "retry_after": null,
+  "disabled_function_suspected": false,
   "notes": ["PHP version: 8.2.7"],
   "error": null,
   "timestamp": 1735219200
@@ -1053,7 +1082,8 @@ This matters for reproducibility in reports.
 - **Fix:** `--param` / `--progress-field` / `--session-name` CRLF validation
 - **Add:** `--session-name` for non-default PHP session names
 - **Add:** `Verdict::NoLfi` and `Verdict::AuthRequired`
-- **Add:** `--lfi-max-requests` cap
+- **Add:** `--lfi-max-attempts` cap
+- **Remove:** RCE verdict; two-marker hit now yields `UNCONFIRMED` (reflection cannot be excluded)
 - **Add:** worker panic logging, LFI status logging at `-v`
 - **Change:** `php_detected` is `Option<bool>`
 - **Change:** banner prints after `clap` parse
@@ -1126,14 +1156,14 @@ See [LICENSE](LICENSE) for the full text.
 - **"Payload in the value, not the filename"** — 2 times
 - **"Two markers, not one"** — 2 times
 - **"No LFI = no exploit"** — 2 times
-- **"Only `Rce` is a positive finding"** — 2 times
+- **"This build has no `CONFIRMED` verdict"** — 2 times
 - **"Without `--lfi`, you have not tested anything"** — 3 times
 - **"Paste this report into your deliverable"** — 2 times
 - **"Learn them all"** (verdicts) — 2 times
 - **"Follow the steps in order"** — 2 times
 - **"Fix any incorrect values before sending"** — 2 times
 - **"A report needs evidence"** — 2 times
-- **"Repeat until `Rce`"** — 2 times
+- **"Repeat until both markers appear"** — 2 times
 - **"Template must contain..."** — 2 times
 - **"NoLfi is not Patched"** — 2 times
 
@@ -1146,7 +1176,7 @@ Each repetition appears as a standalone line so it survives skimming.
 3. **First attempt** — the exact command, with `%SID%`/`%CMD%`/`%PARAM%` explained
 4. **Read verdict** — table mapping verdict → action
 5. **Prove execution** — `id; hostname; uname -a; head /etc/passwd` + JSON report
-6. **Retries/tuning** — 5 escalation paths when `Poisoned`
+6. **Retries/tuning** — 5 escalation paths when `UNCONFIRMED`
 7. **Save report** — what evidence to keep
 
 Every step tells you **what to do** and **why**, and most steps tell you
