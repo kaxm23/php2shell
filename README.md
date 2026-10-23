@@ -1240,6 +1240,4 @@ collection primitive.
 
 ---
 
-## License
-MIT 
-```
+
