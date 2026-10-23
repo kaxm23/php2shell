@@ -463,7 +463,7 @@ tested the target.** Always supply `--lfi`.
 
 ### Step 5: Prove command execution
 
-Once you have `Rce`, run a **proof-of-impact** command — not just `id`:
+Once both markers appear, add an **out-of-band proof** — not just `id`:
 
 ```bash
 php2shell -c 'id; hostname; whoami; uname -a; head -3 /etc/passwd' \
@@ -487,7 +487,7 @@ Paste it into your deliverable.
 
 ### Step 6: Retries and tuning
 
-If the first attempt gives `UNCONFIRMED` (not `Rce`), try these in order:
+If the first attempt gives `UNCONFIRMED` with no marker pair, try these in order:
 
 **A. Increase retries.**
 
@@ -754,7 +754,7 @@ php2shell -v \
     http://lab.local/
 ```
 
-If `Rce`:
+If both markers appear:
 
 ```
 ==============================================
@@ -1024,7 +1024,7 @@ consider `--proxy` through a rotating pool.
 | `phpggc` | PHP object injection | N/A | N/A | N/A | N/A |
 
 None of the above implements the two-marker proof or a verdict system that
-distinguishes `NO_LFI` from `UNCONFIRMED` from `Rce`. That's the niche.
+distinguishes `NO_LFI` from `UNCONFIRMED`. That's the niche.
 
 ---
 

@@ -26,3 +26,5 @@ forum.html
 # Local scratch / target artifacts — never commit
 cookies.txt
 forum.html
+README.md.bak
+*.bak
